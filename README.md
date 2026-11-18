@@ -8,6 +8,7 @@
 
 - 样本台账：批次、可用份数、保管位置，可录入。
 - 流转申请：关联样本、指定数量和接收实验室。
+- 成组导入：一批多组（每组一个新样本及其多条移交申请），按样本编号关联、行顺序不限；组级原子、撞号拒绝、幂等重传、断点续处理。
 - 并发执行：Redis 队列、独立 Python worker、可设锁等待上限。
 - 冲突证据：Backend PID、SQLSTATE、回执回滚、数量守恒与 JSON 导出。
 - 管理员审计：登录、写入和执行动作。
@@ -38,20 +39,31 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 输入：流转申请、50–2000ms 锁等待上限。输出：实际 PID、错误码、等待耗时、剩余量、接收量、回执数和 SHA256。口径为 `remaining + received == initial`、remaining非负、仅A回执一条；B回执必须为零。等待耗时受主机负载影响，SHA包含PID和实际耗时因此每次不同。算法输入和最终不变量可复现。失败态包括申请量超限、数据库错误、线程协调超时、队列不可用；页面显示错误并允许创建新演练。
 
-单 worker 顺序运行任务，无生产重试/崩溃恢复调度；worker中断时 running 任务需要人工重建，不能用作生产样本库存扣减。
+## 成组导入语义
+
+纸质交接补录按「批号 + 分组」提交（`POST /imports`，202 受理）。每组是一个新样本和它的多条移交申请，按样本编号关联，组内行顺序不限。
+
+- **组级原子**：worker 对每组开独立事务（写段用 SAVEPOINT 保护）。组内任一申请校验失败（如后行移交量超过样本可用量、申请编号已存在），该组样本与申请整组回滚并记 `rejected` 与拒绝原因；同批其余组继续入库。
+- **结论与写入同事务**：组状态 `committed/rejected`、拒绝原因、批次计数与业务行、审计在同一事务提交，已处理组立即可在台账、申请簿和导入页查询。
+- **并发撞号**：样本编号、申请编号的数据库唯一索引是硬保证；与日常登记或其他组并发撞号时，后提交方捕获 SQLSTATE 23505，整组拒绝并保留原记录。
+- **幂等重传（提交后断线重传）**：以批号为幂等键，整包 SHA256 内容指纹随批次落库。同批号同内容重传直接返回既有批次，不写业务行、不记审计，并对仍 pending 的组重新入队；同批号不同内容一律 409 拒绝。同内容换批号属独立批次，撞号时按组拒绝。
+- **中断恢复**：worker 启动时把所有 `pending` 组重新入队（`requeue_pending`），空闲期每 30s 再自愈一次丢失的队列消息；已 `committed/rejected` 的组重复投递只跳过、不重复处理。队列键 `locklab:import:queue`，与演练队列 `locklab:queue` 由同一 worker 顺序消费。
+- 页面「成组导入」支持粘贴/文件载入 JSON，展示处理中与已结束批次、各组结论和拒绝原因，处理中每 1.5s 自动刷新；观察员只读，提交按钮禁用。
+
+单 worker 顺序运行两个队列任务。导入组具备上述崩溃恢复；演练（trial）无生产重试/崩溃恢复调度，worker 中断时 running 演练仍需人工重建，不能用作生产样本库存扣减。
 
 ## 工程说明
 
 |服务|技术|职责|
 |---|---|---|
-|frontend|原生HTML/CSS/JS + Nginx|4业务页+登录，反向代理 /api/|
-|backend|Python3.11/FastAPI/SQLAlchemy/PyJWT|校验、权限、审计、持久化|
-|worker|Python3.11/psycopg|真实双连接锁竞争|
+|frontend|原生HTML/CSS/JS + Nginx|5业务页+登录，反向代理 /api/|
+|backend|Python3.11/FastAPI/SQLAlchemy/PyJWT|校验、权限、审计、成组导入受理、持久化|
+|worker|Python3.11/psycopg|真实双连接锁竞争；顺序消费演练与导入两个队列|
 |db|PostgreSQL16|业务数据、隔离镜像账本|
 |redis|Redis7|持久队列|
 
 目录：`frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}`；`backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}`；`backend/scripts/seed_demo.py`；`backend/migrations/001_initial.sql`。
-核心实体 Sample、Transfer、Trial 各有模型、schema、服务、路由、API、store与页面；共享 table/badge/frame 组件。共享枚举 roles/run states 位于后端 `src/constants/enums.py`、模型/权限引用和前端 `src/constants/enums.js`、frame/badge；状态枚举 queued/running/completed/failed。两个后端中间件：request_id/errors。
+核心实体 Sample、Transfer、Trial、ImportBatch、ImportGroup 各有模型；导入链路含 schema（`schemas/importer.py`）、服务（`services/importer.py`）、路由（`routes/imports.py`）、API/store 与页面（`pages/imports.js`）；共享 table/badge/frame 组件。共享枚举 roles/run/import states 位于后端 `src/constants/enums.py`、模型/权限引用和前端 `src/constants/enums.js`、frame/badge；演练状态 queued/running/completed/failed，导入批次 processing/finished、导入组 pending/committed/rejected。两个后端中间件：request_id/errors。
 
 环境变量见 `.env.example`：COMPOSE_PROJECT_NAME、三端口、DB_PASSWORD、JWT_SECRET、SEED_DEMO。默认密码仅用于本地演示；JWT8小时有效。seed按自然键仅插入缺失行，不覆盖修改。所有5服务有健康检查，backend/worker依赖健康数据库/Redis，frontend依赖backend；db/redis/artifacts使用命名卷。停止及清空本项目数据：`docker compose down -v --remove-orphans`。
 

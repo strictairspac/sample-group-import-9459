@@ -32,3 +32,18 @@ class Audit(Base):
     __tablename__='audit_logs'
     id=Column(Integer,primary_key=True);actor=Column(String(120),nullable=False);action=Column(String(160),nullable=False)
     created_at=Column(DateTime(timezone=True),default=lambda:datetime.now(timezone.utc))
+class ImportBatch(Base):
+    __tablename__='import_batches'
+    id=Column(Integer,primary_key=True);batch_no=Column(String(80),unique=True,nullable=False)
+    content_hash=Column(String(64),nullable=False,index=True);status=Column(String(20),default='processing',nullable=False)
+    group_total=Column(Integer,nullable=False,default=0);group_committed=Column(Integer,nullable=False,default=0)
+    group_rejected=Column(Integer,nullable=False,default=0);created_by=Column(String(120),nullable=False)
+    created_at=Column(DateTime(timezone=True),default=lambda:datetime.now(timezone.utc));finished_at=Column(DateTime(timezone=True),nullable=True)
+class ImportGroup(Base):
+    __tablename__='import_groups'
+    id=Column(Integer,primary_key=True);batch_id=Column(Integer,ForeignKey('import_batches.id'),nullable=False)
+    group_ref=Column(String(80),nullable=False);sample_code=Column(String(80),nullable=False)
+    transfer_count=Column(Integer,nullable=False,default=0);status=Column(String(20),nullable=False)
+    reason=Column(Text,default='');content_hash=Column(String(64),nullable=False);payload=Column(JSON,nullable=False)
+    processed_at=Column(DateTime(timezone=True),nullable=True)
+    __table_args__=(UniqueConstraint('batch_id','group_ref'),)
